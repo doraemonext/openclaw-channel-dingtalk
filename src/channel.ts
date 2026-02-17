@@ -1376,7 +1376,7 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
     nativeCommands: false,
     blockStreaming: false,
   },
-  reload: { configPrefixes: ['channels.dingtalk'] },
+  reload: { configPrefixes: ['channels.dingtalk', 'bindings'] },
   config: {
     listAccountIds: (cfg: OpenClawConfig): string[] => {
       const config = getConfig(cfg);
