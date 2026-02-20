@@ -65,6 +65,9 @@ const CARD_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 // DingTalk API base URL
 const DINGTALK_API = 'https://api.dingtalk.com';
 
+// Thinking and tool usage message truncate length
+const THINKING_TRUNCATE_LENGTH = 500;
+
 // ============ Message Deduplication ============
 // Prevents duplicate message processing when DingTalk retries delivery
 // Uses pure in-memory storage with short TTL and lazy cleanup during processing
@@ -637,9 +640,72 @@ async function downloadMedia(
 function extractMessageContent(data: DingTalkInboundMessage): MessageContent {
   const msgtype = data.msgtype || 'text';
 
+  // Helper function to format quoted content from DingTalk's reply message structure
+  const formatQuotedContent = (): string => {
+    const textField = data.text as any;
+
+    // Case 1: isReplyMsg=true WITH repliedMsg content (desktop client)
+    if (textField?.isReplyMsg && textField?.repliedMsg) {
+      const repliedMsg = textField.repliedMsg;
+      const content = repliedMsg?.content;
+
+      // Try plain text format first
+      if (content?.text) {
+        const quoteText = content.text.trim();
+        if (quoteText) {
+          return `[引用消息: "${quoteText}"]\n\n`;
+        }
+      }
+
+      // Handle richText format
+      if (content?.richText && Array.isArray(content.richText)) {
+        const textParts: string[] = [];
+        for (const part of content.richText) {
+          if (part.msgType === 'text' && part.content) {
+            textParts.push(part.content);
+          } else if (part.msgType === 'emoji' || part.type === 'emoji') {
+            textParts.push(part.content || '[表情]');
+          } else if (part.msgType === 'picture' || part.type === 'picture') {
+            textParts.push('[图片]');
+          } else if (part.msgType === 'at' || part.type === 'at') {
+            textParts.push(`@${part.content || part.atName || '某人'}`);
+          } else if (part.text) {
+            textParts.push(part.text);
+          }
+        }
+        const quoteText = textParts.join('').trim();
+        if (quoteText) {
+          return `[引用消息: "${quoteText}"]\n\n`;
+        }
+      }
+    }
+
+    // Case 2: isReplyMsg=true WITHOUT repliedMsg (rich media quote, mobile or desktop - only has originalMsgId)
+    if (textField?.isReplyMsg && !textField?.repliedMsg && data.originalMsgId) {
+      return `[这是一条引用消息，原消息ID: ${data.originalMsgId}]\n\n`;
+    }
+
+    // Fallback: Check for quoteMessage field (legacy format)
+    if (data.quoteMessage) {
+      const quoteText = data.quoteMessage.text?.content?.trim() || '';
+      if (quoteText) {
+        return `[引用消息: "${quoteText}"]\n\n`;
+      }
+    }
+
+    // Fallback: Check for quoteContent in content field
+    if (data.content?.quoteContent) {
+      return `[引用消息: "${data.content.quoteContent}"]\n\n`;
+    }
+
+    return '';
+  };
+
+  const quotedPrefix = formatQuotedContent();
+
   // Logic for different message types
   if (msgtype === 'text') {
-    return { text: data.text?.content?.trim() || '', messageType: 'text' };
+    return { text: quotedPrefix + (data.text?.content?.trim() || ''), messageType: 'text' };
   }
 
   // Improved richText parsing: join all text/at components and extract first picture
@@ -657,7 +723,7 @@ function extractMessageContent(data: DingTalkInboundMessage): MessageContent {
       }
     }
     return {
-      text: text.trim() || (pictureDownloadCode ? '<media:image>' : '[富文本消息]'),
+      text: quotedPrefix + (text.trim() || (pictureDownloadCode ? '<media:image>' : '[富文本消息]')),
       mediaPath: pictureDownloadCode,
       mediaType: pictureDownloadCode ? 'image' : undefined,
       messageType: 'richText',
@@ -850,6 +916,29 @@ async function createAICard(
     }
     return null;
   }
+}
+
+/**
+ * Format thinking/tool content for display in AI Card
+ * Truncates to configured length and adds "> " prefix to each line
+ */
+function formatContentForCard(content: string, type: 'thinking' | 'tool'): string {
+  if (!content) return '';
+
+  // truncate to configured length, add ellipsis if truncated
+  const truncated = content.slice(0, THINKING_TRUNCATE_LENGTH) + (content.length > THINKING_TRUNCATE_LENGTH ? '…' : '');
+
+  // split into lines, then escape leading/trailing underscore per line, then prefix with ">"
+  const quotedLines = truncated
+    .split('\n')
+    .map((line) => line.replace(/^_(?=[^ ])/, '*').replace(/(?<=[^ ])_(?=$)/, '*'))
+    .map((line) => `> ${line}`)
+    .join('\n');
+
+  const emoji = type === 'thinking' ? '🤔' : '🛠️';
+  const label = type === 'thinking' ? '思考中' : '工具执行';
+
+  return `${emoji} **${label}**\n${quotedLines}`;
 }
 
 /**
@@ -1292,10 +1381,23 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
     cfg,
     dispatcherOptions: {
       responsePrefix: '',
-      deliver: async (payload: any) => {
+      deliver: async (payload: any, info?: { kind: string }) => {
         try {
           const textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
+
+          // Handle tool results separately for AI Card streaming
+          //
+          // Note: use /verbose on in conversation to get tool execution info
+          //
+          if (useCardMode && currentAICard && info?.kind === 'tool') {
+            log?.info?.(`[DingTalk] Tool result received, streaming to AI Card: ${textToSend.slice(0, 100)}`);
+            const toolText = formatContentForCard(textToSend, 'tool');
+            if (toolText) {
+              await streamAICard(currentAICard, toolText, false, log);
+              return; // Don't send via sendMessage for tool results in card mode
+            }
+          }
 
           lastCardContent = textToSend;
           await sendMessage(dingtalkConfig, to, textToSend, {
@@ -1307,6 +1409,21 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
         } catch (err: any) {
           log?.error?.(`[DingTalk] Reply failed: ${err.message}`);
           throw err;
+        }
+      },
+    },
+    replyOptions: {
+      // Handle reasoning stream updates to update the AI Card content in real-time
+      // Note: use /reasoning stream in conversation to get reasoning stream updates
+      //
+      onReasoningStream: async (payload: any) => {
+        if (!useCardMode || !currentAICard) { return; }
+        const thinkingText = formatContentForCard(payload.text, 'thinking');
+        if (!thinkingText) return;
+        try {
+          await streamAICard(currentAICard, thinkingText, false, log);
+        } catch (err: any) {
+          log?.debug?.(`[DingTalk] Thinking stream update failed: ${err.message}`);
         }
       },
     },
@@ -1401,7 +1518,8 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       };
     },
     defaultAccountId: (): string => 'default',
-    isConfigured: (account: ResolvedAccount): boolean => Boolean(account.config?.clientId && account.config?.clientSecret),
+    isConfigured: (account: ResolvedAccount): boolean =>
+      Boolean(account.config?.clientId && account.config?.clientSecret),
     describeAccount: (account: ResolvedAccount) => ({
       accountId: account.accountId,
       name: account.config?.name || 'DingTalk',
@@ -1462,7 +1580,9 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         }
         throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
       } catch (err: any) {
-        throw new Error(typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendText failed');
+        throw new Error(
+          typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendText failed'
+        );
       }
     },
     sendMedia: async ({
@@ -1479,13 +1599,13 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       if (!config.clientId) throw new Error('DingTalk not configured');
 
       // Support mediaPath, filePath, and mediaUrl parameter names
-      const actualMediaPath = mediaPath || filePath || mediaUrl;
+      const rawMediaPath = mediaPath || filePath || mediaUrl;
 
       getLogger()?.debug?.(
-        `[DingTalk] sendMedia called: to=${to}, mediaPath=${mediaPath}, filePath=${filePath}, mediaUrl=${mediaUrl}, actualMediaPath=${actualMediaPath}`
+        `[DingTalk] sendMedia called: to=${to}, mediaPath=${mediaPath}, filePath=${filePath}, mediaUrl=${mediaUrl}, rawMediaPath=${rawMediaPath}`
       );
 
-      if (!actualMediaPath) {
+      if (!rawMediaPath) {
         throw new Error(
           `mediaPath, filePath, or mediaUrl is required. Received: ${JSON.stringify({
             to,
@@ -1495,6 +1615,13 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
           })}`
         );
       }
+
+      // Resolve user path to expand ~ and relative paths
+      const actualMediaPath = resolveUserPath(rawMediaPath);
+
+      getLogger()?.debug?.(
+        `[DingTalk] sendMedia resolved path: rawMediaPath=${rawMediaPath}, actualMediaPath=${actualMediaPath}`
+      );
 
       try {
         // Detect media type from file extension if not provided
@@ -1518,7 +1645,9 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         }
         throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
       } catch (err: any) {
-        throw new Error(typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendMedia failed');
+        throw new Error(
+          typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendMedia failed'
+        );
       }
     },
   },
@@ -1674,6 +1803,11 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
             lastError: null,
           });
           ctx.log?.info?.(`[${account.accountId}] DingTalk Stream client connected successfully`);
+
+          // Keep startAccount alive until the connection manager is explicitly stopped.
+          // The Gateway treats the Promise resolution as "channel finished" and would
+          // trigger auto-restart if we returned here immediately after connecting.
+          await connectionManager.waitForStop();
         } else {
           // Startup was cancelled or connection is not established; do not overwrite stopped snapshot.
           ctx.log?.info?.(

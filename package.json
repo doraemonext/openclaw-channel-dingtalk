@@ -1,6 +1,6 @@
 {
-  "name": "openclaw-dingtalk",
-  "version": "2.6.4",
+  "name": "@soimy/dingtalk",
+  "version": "2.7.0",
   "description": "DingTalk (钉钉) channel plugin for OpenClaw",
   "main": "index.ts",
   "type": "module",
@@ -13,8 +13,7 @@
   "scripts": {
     "type-check": "tsc --noEmit",
     "lint": "eslint index.ts src/",
-    "lint:fix": "eslint --fix index.ts src/ && prettier --write index.ts src/",
-    "prepublishOnly": "npm run type-check && npm run lint"
+    "lint:fix": "eslint --fix index.ts src/ && prettier --write index.ts src/"
   },
   "keywords": [
     "clawdbot",
@@ -32,6 +31,10 @@
     "url": "git+https://github.com/soimy/openclaw-channel-dingtalk.git"
   },
   "homepage": "https://github.com/soimy/openclaw-channel-dingtalk",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "dependencies": {
     "axios": "^1.6.0",
     "dingtalk-stream": "^2.1.4",
@@ -72,7 +75,7 @@
       ]
     },
     "install": {
-      "npmSpec": "openclaw-dingtalk",
+      "npmSpec": "@soimy/dingtalk",
       "localPath": ".",
       "defaultChoice": "npm"
     }
